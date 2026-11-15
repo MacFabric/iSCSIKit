@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 /// A transport factory that "reboots" the MockTarget: every call spins up a

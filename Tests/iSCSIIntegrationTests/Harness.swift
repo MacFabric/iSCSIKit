@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 /// One running MockTarget endpoint wired to an initiator-side transport.
@@ -68,21 +68,4 @@ func loggedInConnection(
     )
     let result = try await connection.login()
     return (connection, harness, result)
-}
-
-/// Session policy tuned for fast tests.
-func testPolicy(
-    retries: Int = 2,
-    recoveryAttempts: Int = 4,
-    nopInterval: Duration? = nil
-) -> SessionPolicy {
-    var policy = SessionPolicy()
-    policy.honorTime2Wait = false // scripted targets reconnect immediately
-    policy.nopInterval = nopInterval
-    policy.nopTimeout = .milliseconds(250)
-    policy.maxRecoveryAttempts = recoveryAttempts
-    policy.recoveryBackoffBase = .milliseconds(10)
-    policy.recoveryBackoffCap = .milliseconds(50)
-    policy.taskRetries = retries
-    return policy
 }

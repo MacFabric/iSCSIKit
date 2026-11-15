@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 /// A target that takes commands and never answers them — the failure the NOP

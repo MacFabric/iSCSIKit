@@ -1,7 +1,7 @@
 #if canImport(Network)
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 /// End-to-end over a real loopback TCP socket, exercising `NetworkTransport`

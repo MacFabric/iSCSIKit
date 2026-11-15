@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# The toolchain iSCSI-NVMe-TCP builds with: Xcode 27.1 on GitHub's Xcode 27
+# image, pinned rather than taken from the image default, which moves between
+# image releases.
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Show toolchain
+        run: swift --version
+
+      # Every target, the fuzz harness included, so it cannot stop compiling
+      # unnoticed.
+      - name: swift build
+        run: swift build
+
+      # Serial on purpose. Several tests bound real durations (a 100 ms
+      # deadline must have fired two seconds later), and on a 3-core runner
+      # running them in parallel failed deterministically while passing
+      # locally every time: a saturated runner makes every continuation late
+      # without making any timeout wrong.
+      - name: swift test
+        run: swift test --no-parallel

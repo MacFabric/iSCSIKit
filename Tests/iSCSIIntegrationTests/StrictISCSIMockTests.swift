@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 /// The initiator side of a MemoryPipe speaking raw iSCSI, for the rules the

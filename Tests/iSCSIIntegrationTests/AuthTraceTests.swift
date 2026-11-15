@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 @testable import iSCSIKit
-@testable import MockTarget
+@testable import iSCSIMockTarget
 
 /// The authentication trace exists because a redacted PDU dump cannot say what
 /// the initiator was *trying* to do — one-way or mutual, as whom, and how far it

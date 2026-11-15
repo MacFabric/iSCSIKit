@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 /// Every test that reads runs twice: status on the final Data-In (phase

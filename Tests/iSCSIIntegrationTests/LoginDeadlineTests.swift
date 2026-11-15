@@ -1,7 +1,6 @@
 import Foundation
 import Testing
-@testable import MockTarget
-@testable import NVMeKit
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 /// A target that accepts the connection and then says nothing. `taskTimeout`
@@ -97,37 +96,5 @@ struct LoginDeadlineTests {
         try await session.logout()
         #expect(ContinuousClock.now - started < .seconds(2))
         await fleet.shutdown()
-    }
-
-    @Test func anNVMeControllerThatNeverSendsICRespTimesOut() async throws {
-        let silent = SilentPeers()
-        let controller = NVMeController(config: testControllerConfig(), policy: policy()) {
-            await silent.makeTransport()
-        }
-        await #expect(throws: DeadlineError.timedOut) { try await controller.activate() }
-        #expect(try await silent.allClosed())
-    }
-
-    @Test func anNVMeControllerThatStallsAfterConnectTimesOut() async throws {
-        // ICResp, Fabrics Connect and the property commands are answered;
-        // Identify, the first admin command, never is.
-        var config = MockNVMeConfig()
-        config.faults.stallCommands = true
-        let fleet = NVMeFleet(config: config)
-        let controller = NVMeController(config: testControllerConfig(), policy: policy()) {
-            await fleet.makeTransport()
-        }
-        await #expect(throws: DeadlineError.timedOut) { try await controller.activate() }
-        await fleet.shutdown()
-    }
-
-    @Test func nvmeDiscoveryAgainstASilentPortalTimesOut() async throws {
-        let silent = SilentPeers()
-        await #expect(throws: DeadlineError.timedOut) {
-            _ = try await NVMeDiscovery.getLogPage(
-                transport: await silent.makeTransport(), host: testHost,
-                timeout: .milliseconds(200))
-        }
-        #expect(try await silent.allClosed())
     }
 }

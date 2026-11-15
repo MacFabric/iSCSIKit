@@ -10,7 +10,7 @@
 
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 @Suite("Resource bounds", .timeLimit(.minutes(2)))
@@ -28,84 +28,6 @@ struct ResourceBoundsTests {
     }
 
     private func mib(_ bytes: UInt64) -> UInt64 { bytes / (1 << 20) }
-
-    // MARK: - The cache honours its cap
-
-    /// `evictLocked` never evicts a *pending* chunk (traffic already on the
-    /// wire); if pending chunks accumulated faster than they resolve, the
-    /// byte budget would stop being a bound at all.
-    @Test func cacheStaysInsideItsByteBudget() throws {
-        let chunk = 256 << 10
-        let maxCached = 8 << 20                 // 8 MiB budget
-        let capacity: UInt64 = 512 << 20        // a 512 MiB "LUN"
-        let cache = PrefetchChunkCache(
-            chunkBytes: chunk,
-            capacity: capacity,
-            maxCachedBytes: maxCached,
-            policy: ReadaheadPolicy(budgetBytes: 4 << 20, maxSlots: 32,
-                                    minStreamBytes: 1 << 20, chunkBytes: chunk),
-            timeout: 5,
-            fetchSync: { _, length in Data(repeating: 0xAB, count: length) },
-            fetchAsync: { _, length, done in done(Data(repeating: 0xAB, count: length)) }
-        )
-
-        // Warm up: establish the working set before measuring.
-        for i in 0 ..< 64 {
-            _ = try cache.read(offset: UInt64(i) * UInt64(chunk), length: chunk)
-        }
-        let before = footprint()
-
-        // Stream 64× the cache's budget through it; nothing may stick.
-        var offset: UInt64 = 0
-        while offset + UInt64(chunk) <= capacity {
-            _ = try cache.read(offset: offset, length: chunk)
-            offset += UInt64(chunk)
-        }
-        // A footprint can shrink between samples (the VM returns pages), and
-        // an unsigned wrap then reads as a 16 EiB "growth".
-        let after = footprint()
-        let grew = after > before ? after - before : 0
-
-        #expect(grew < UInt64(maxCached) * 4,
-                "512 MiB streamed through an 8 MiB cache grew the process by \(mib(grew)) MiB")
-    }
-
-    /// Writes patch cached chunks rather than invalidating them; the patching
-    /// path allocates too, so it gets the same question.
-    @Test func writeThroughPatchingDoesNotAccumulate() throws {
-        let chunk = 256 << 10
-        let capacity: UInt64 = 64 << 20
-        let cache = PrefetchChunkCache(
-            chunkBytes: chunk,
-            capacity: capacity,
-            maxCachedBytes: 8 << 20,
-            policy: ReadaheadPolicy(budgetBytes: 4 << 20, maxSlots: 32,
-                                    minStreamBytes: 1 << 20, chunkBytes: chunk),
-            timeout: 5,
-            fetchSync: { _, length in Data(repeating: 0xAB, count: length) },
-            fetchAsync: { _, length, done in done(Data(repeating: 0xAB, count: length)) }
-        )
-        let payload = Data(repeating: 0xCD, count: 64 << 10)
-
-        for i in 0 ..< 32 {
-            _ = try cache.read(offset: UInt64(i) * UInt64(chunk), length: chunk)
-        }
-        let before = footprint()
-
-        // 4096 write cycles over the same region — the journal pattern.
-        for i in 0 ..< 4096 {
-            let offset = UInt64((i % 256) * (64 << 10))
-            cache.willWrite(offset: offset, length: payload.count)
-            cache.didWrite(payload, at: offset)
-        }
-        // A footprint can shrink between samples (the VM returns pages), and
-        // an unsigned wrap then reads as a 16 EiB "growth".
-        let after = footprint()
-        let grew = after > before ? after - before : 0
-
-        #expect(grew < 32 << 20,
-                "4096 write-through cycles grew the process by \(mib(grew)) MiB")
-    }
 
     // MARK: - The session does not accumulate per operation
 

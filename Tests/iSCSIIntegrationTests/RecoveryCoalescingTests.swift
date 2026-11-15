@@ -1,7 +1,6 @@
 import Foundation
 import Testing
-@testable import MockTarget
-@testable import NVMeKit
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 /// Concurrent failures must coalesce onto ONE recovery.
@@ -49,41 +48,6 @@ struct RecoveryCoalescingTests {
         var connectionLost: Int { lock.lock(); defer { lock.unlock() }; return lost }
         var recoveries: Int { lock.lock(); defer { lock.unlock() }; return recovered }
         var recoveryAttempts: Int { lock.lock(); defer { lock.unlock() }; return attempts }
-    }
-
-    static func droppingNVMe(after pdus: Int) -> MockTargetFaults {
-        var faults = MockTargetFaults()
-        faults.dropAfterSentPDUs = pdus
-        return faults
-    }
-
-    @Test func nvmeConcurrentFailuresCoalesceOntoOneRecovery() async throws {
-        // Connection order: admin, I/O, then the recovered pair. The I/O queue
-        // dies after its first completion, with the rest of the batch still in
-        // flight — so several commands fail together.
-        let fleet = NVMeFleet(faultScripts: [MockTargetFaults(),
-                                             Self.droppingNVMe(after: 1),
-                                             MockTargetFaults()])
-        let controller = try await activatedController(fleet: fleet)
-        let counter = EventCounter()
-        await controller.setEventHandler { counter.note($0) }
-
-        let device = NVMeBlockDevice(controller: controller, nsid: 1)
-        _ = try await device.readCapacity()
-
-        let payload = Data(repeating: 0x5A, count: 4096)
-        await withTaskGroup(of: Void.self) { group in
-            for i in 0 ..< 8 {
-                group.addTask { try? await device.write(offset: UInt64(i) * 4096, data: payload) }
-            }
-        }
-
-        // One connection died, so exactly one recovery episode should be
-        // reported and exactly one performed.
-        #expect(counter.connectionLost == 1)
-        #expect(counter.recoveries == 1)
-        #expect(await controller.recoveryCount == 1)
-        await fleet.shutdown()
     }
 
     @Test func iscsiConcurrentFailuresCoalesceOntoOneRecovery() async throws {

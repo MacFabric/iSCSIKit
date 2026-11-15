@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import iSCSIMockTarget
 @testable import iSCSIKit
 
 @Suite("Integration: block device over iSCSI", .timeLimit(.minutes(1)))

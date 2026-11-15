@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import iSCSIDaemon
 @testable import iSCSIKit
-import MockTarget
+import iSCSIMockTarget
 
 /// Login redirects (RFC 7143 §11.13.5, status class 1). An EqualLogic group
 /// answers every normal login on its group address with "moved temporarily"
@@ -192,33 +191,5 @@ struct LoginRedirectTests {
         #expect(outcome.movedPermanentlyTo
                 == TargetPortal(host: "10.0.0.2", port: 3261, portalGroupTag: 1))
         await fleet.shutdown()
-    }
-
-    // MARK: Through the daemon
-
-    /// The redirect connect is the daemon's to make, with the target's
-    /// interface pin: a pinned target that followed a redirect over whatever
-    /// interface macOS chose would quietly undo the pin.
-    @Test("the daemon follows a redirect over the same interface pin")
-    func daemonFollowsRedirectWithPin() async throws {
-        let calls = ConnectLog()
-        let harnesses = HarnessBox()
-        defer { harnesses.cancelAll() }
-        let disk = RAMDisk()
-        let pinned = InterfaceBinding(name: "en18", fallback: false)
-        let core = DaemonCore(initiatorName: "iqn.test:initiator", policy: testPolicy(),
-                              hostIdentity: testHost) { host, port, binding in
-            calls.add("\(host):\(port) via \(binding?.name ?? "routing")")
-            let (initiatorSide, targetSide) = MemoryPipe.pair()
-            let config = host == "group" ? Self.redirecting(temporary: true) : MockTargetConfig()
-            let target = MockTarget(config: config, disk: disk, transport: targetSide)
-            harnesses.add(Task { await target.run() })
-            return initiatorSide
-        }
-
-        let handle = try await core.login(host: "group", port: 3260, targetIQN: spyIQN,
-                                          lun: 0, binding: pinned)
-        #expect(calls.all == ["group:3260 via en18", "10.0.0.2:3261 via en18"])
-        try await core.logout(handle)
     }
 }

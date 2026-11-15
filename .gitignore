@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+DerivedData/
+.DS_Store
+# An instrumented binary run outside `swift test` drops its raw profile in the
+# working directory rather than under .build/.
+*.profraw
+# Where scripts/fuzz-campaign.sh leaves the logs of failing seeds.
+fuzz-failures/
