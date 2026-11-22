@@ -42,7 +42,15 @@ public actor ISCSIConnection {
         /// CmdSN the command went out with — ABORT TASK must quote it as
         /// RefCmdSN (§11.5.5).
         let cmdSN: UInt32
-        var readBuffer: Data
+        /// Where a read's Data-In is received: the caller's region, or one
+        /// made here. Not zeroed in advance; `finishRead` clears whatever was
+        /// never delivered before the bytes can be seen. nil for a task that
+        /// reads nothing.
+        let destination: ReadBuffer.Region?
+        /// The caller supplied `destination`, so the result carries no data.
+        let callerOwnsDestination: Bool
+        /// Bytes the command asked for.
+        let expected: Int
         /// Data-In bytes accepted so far; a GOOD completion must account for
         /// every byte or the read has silent zero-filled holes.
         var receivedBytes = 0
@@ -60,12 +68,31 @@ public actor ISCSIConnection {
             self.task = task
             self.cmdSN = cmdSN
             if case .read(let expected) = task.direction {
-                readBuffer = Data(count: Int(expected))
+                self.expected = Int(expected)
+                callerOwnsDestination = task.readDestination != nil
+                destination = task.readDestination ?? ReadBuffer(count: Int(expected)).whole
             } else {
-                readBuffer = Data()
+                expected = 0
+                callerOwnsDestination = false
+                destination = nil
             }
         }
     }
+
+    /// A Data-In PDU whose header has been taken and whose data is still
+    /// arriving, and where that data is going.
+    private struct Inbound {
+        let head: PDUDeframer.Head
+        /// The read's own buffer, when the checks `handleDataIn` will make
+        /// have already been made; nil for every other PDU, whose data is
+        /// taken whole.
+        let placement: UnsafeMutableRawBufferPointer?
+        /// Keeps `placement`'s memory alive while it is being filled.
+        let owner: ReadBuffer?
+        var filled = 0
+    }
+
+    private var inbound: Inbound?
 
     private let transport: any ConnectionTransport
     private let loginConfig: LoginConfig
@@ -207,6 +234,11 @@ public actor ISCSIConnection {
         // `NetworkTransport.send`). A sibling chunk cancelled by its task
         // group usually lands here, and costs nothing.
         try Task.checkCancellation()
+        if case .read(let expected) = task.direction, let region = task.readDestination,
+           region.count < Int(expected) {
+            throw ConnectionError.protocolError(
+                "read of \(expected) bytes given a destination of \(region.count)")
+        }
 
         let itt = allocateITT()
         let pending = PendingTask(task: task, cmdSN: cmdSN)
@@ -510,9 +542,7 @@ public actor ISCSIConnection {
         do {
             while state == .fullFeature {
                 // Drain first: login may have left a whole PDU buffered.
-                while let raw = try deframer.next() {
-                    try await handle(raw)
-                }
+                try await drain()
                 guard state == .fullFeature else { return }
                 guard let chunk = try await transport.receive() else {
                     await close(reason: .connectionLost("EOF"))
@@ -529,7 +559,63 @@ public actor ISCSIConnection {
         }
     }
 
-    private func handle(_ raw: RawPDU) async throws {
+    /// Handle everything the buffered bytes allow: whole PDUs, and as much
+    /// of a Data-In's data as has arrived, moved straight into the buffer of
+    /// the read it answers. Returns when more bytes are needed.
+    ///
+    /// The state check each time round matters. `handle` can suspend, and a
+    /// close that began meanwhile must be the end of it: once a connection
+    /// is closing, nothing more is written into a read's buffer, which is
+    /// what lets a caller that gave up on this connection retry elsewhere
+    /// into the same memory.
+    private func drain() async throws {
+        while state == .fullFeature {
+            if inbound == nil {
+                guard let head = try deframer.nextHead() else { return }
+                guard head.dataLength > 0 else {
+                    try await handle(RawPDU(bhs: head.bhs, ahs: head.ahs))
+                    continue
+                }
+                let target = placement(for: head)
+                inbound = Inbound(head: head, placement: target?.bytes, owner: target?.owner)
+            }
+            guard var current = inbound else { continue }
+            guard let room = current.placement else {
+                guard let data = try deframer.takeData() else { return }
+                inbound = nil
+                try await handle(RawPDU(bhs: current.head.bhs, ahs: current.head.ahs, data: data))
+                continue
+            }
+            current.filled += deframer.readData(
+                into: UnsafeMutableRawBufferPointer(rebasing: room[current.filled...]))
+            inbound = current
+            guard deframer.dataRemaining == 0, try deframer.finishData() else { return }
+            inbound = nil
+            try await handle(RawPDU(bhs: current.head.bhs, ahs: current.head.ahs),
+                             placedBytes: current.head.dataLength)
+        }
+    }
+
+    /// Where the data of the Data-In PDU with this header belongs, if it is
+    /// one `handleDataIn` will accept as it stands: for a read we are
+    /// waiting on, next in its sequence, and inside its buffer. Changes
+    /// nothing. Anything else gets nil, is taken whole, and is refused (or
+    /// absorbed, for an abandoned task) by `handleDataIn` with the reason.
+    private func placement(for head: PDUDeframer.Head)
+        -> (bytes: UnsafeMutableRawBufferPointer, owner: ReadBuffer)? {
+        guard head.bhs.u8(0) & 0x3F == Opcode.scsiDataIn.rawValue,
+              let pending = pendingTasks[head.bhs.beU32(16)], !pending.terminated,
+              let destination = pending.destination,
+              head.bhs.beU32(36) == pending.nextDataSN
+        else { return nil }
+        let offset = Int(head.bhs.beU32(40))
+        guard offset == pending.receivedBytes, head.dataLength <= pending.expected - offset else { return nil }
+        return (destination.bytes(offset ..< offset + head.dataLength), destination.buffer)
+    }
+
+    /// `placedBytes`: the length of a Data-In's data segment when `drain`
+    /// has already put it in the read's buffer; `raw.data` is then empty.
+    private func handle(_ raw: RawPDU, placedBytes: Int? = nil) async throws {
         let pdu = try AnyPDU.decode(raw)
         switch pdu {
         case .scsiResponse(let resp):
@@ -539,7 +625,7 @@ public actor ISCSIConnection {
         case .scsiDataIn(let dataIn):
             updateWindow(expCmdSN: dataIn.expCmdSN, maxCmdSN: dataIn.maxCmdSN)
             if dataIn.statusPresent { try advanceStatSN(dataIn.statSN) }
-            try handleDataIn(dataIn)
+            try handleDataIn(dataIn, placedBytes: placedBytes)
         case .r2t(let r2t):
             updateWindow(expCmdSN: r2t.expCmdSN, maxCmdSN: r2t.maxCmdSN)
             try handleR2T(r2t)
@@ -621,32 +707,40 @@ public actor ISCSIConnection {
             return
         }
         var result = SCSITaskResult(status: resp.status)
-        result.data = pending.readBuffer
         result.residualCount = resp.residualCount
         result.residualIsOverflow = resp.residualOverflow
-        if case .read = pending.task.direction {
-            var valid = pending.readBuffer.count
-            if resp.residualUnderflow {
-                valid -= Int(min(resp.residualCount, UInt32(pending.readBuffer.count)))
-                result.data = pending.readBuffer.prefix(valid)
-            }
-            // GOOD promises the data phase delivered everything the residual
-            // accounting claims; anything less is a hole the pre-zeroed
-            // buffer would silently paper over.
-            if resp.status == 0x00 && pending.receivedBytes != valid {
-                // Already out of `pendingTasks`, so `close` will not fail it:
-                // fail it here, or its caller waits out the task timeout.
-                let error = ConnectionError.protocolError(
-                    "read completed GOOD with \(pending.receivedBytes) of \(valid) bytes delivered")
-                pending.completion.complete(.failure(error))
-                throw error
-            }
-        }
+        result.data = try finishRead(pending, status: resp.status,
+                                     underflow: resp.residualUnderflow ? resp.residualCount : nil)
         if resp.status == 0x02 { result.sense = resp.senseData }
         pending.completion.complete(.success(result))
     }
 
-    private func handleDataIn(_ dataIn: DataInPDU) throws {
+    /// The data a completed task returns, checked against what was received.
+    ///
+    /// GOOD promises the data phase delivered everything the residual
+    /// accounting claims; anything less is a hole, so the task and the
+    /// connection fail. The task is already out of `pendingTasks`, where
+    /// `close` would have failed it, so it is failed here, or its caller
+    /// waits out the task timeout.
+    ///
+    /// Whatever was not delivered is zeroed here, at the end, which is what
+    /// the buffer being zeroed at the start used to provide.
+    private func finishRead(_ pending: PendingTask, status: UInt8, underflow: UInt32?) throws -> Data {
+        guard let destination = pending.destination else { return Data() }
+        var valid = pending.expected
+        if let underflow { valid -= Int(min(underflow, UInt32(pending.expected))) }
+        if status == 0x00 && pending.receivedBytes != valid {
+            let error = ConnectionError.protocolError(
+                "read completed GOOD with \(pending.receivedBytes) of \(valid) bytes delivered")
+            pending.completion.complete(.failure(error))
+            throw error
+        }
+        destination.zero(pending.receivedBytes ..< pending.expected)
+        if pending.callerOwnsDestination { return Data() }
+        return destination.data(prefix: underflow == nil ? pending.expected : valid)
+    }
+
+    private func handleDataIn(_ dataIn: DataInPDU, placedBytes: Int? = nil) throws {
         guard let pending = pendingTasks[dataIn.initiatorTaskTag] else {
             throw ConnectionError.protocolError("Data-In for unknown ITT \(dataIn.initiatorTaskTag)")
         }
@@ -655,9 +749,11 @@ public actor ISCSIConnection {
             if dataIn.statusPresent { pendingTasks.removeValue(forKey: dataIn.initiatorTaskTag) }
             return
         }
-        guard case .read(let expected) = pending.task.direction else {
+        guard let destination = pending.destination else {
             throw ConnectionError.protocolError("Data-In for non-read task")
         }
+        // In the read's buffer already, or still in the PDU.
+        let segmentLength = placedBytes ?? dataIn.dataSegment.count
         // §11.7.6: DataSN is sequential for the task; with DataPDUInOrder in
         // force the offsets are contiguous too. At ERL0 a gap is data the
         // target will never resend — fail now, not with a zero-filled buffer.
@@ -671,33 +767,22 @@ public actor ISCSIConnection {
             throw ConnectionError.protocolError(
                 "Data-In at offset \(offset), expected \(pending.receivedBytes)")
         }
-        let end = offset + dataIn.dataSegment.count
-        guard end <= Int(expected) else {
+        guard segmentLength <= pending.expected - offset else {
             throw ConnectionError.protocolError(
-                "Data-In outside read buffer (offset \(offset), \(dataIn.dataSegment.count) bytes)"
+                "Data-In outside read buffer (offset \(offset), \(segmentLength) bytes)"
             )
         }
-        pending.readBuffer.setSub(dataIn.dataSegment, offset)
-        pending.receivedBytes = end
+        if placedBytes == nil { destination.write(dataIn.dataSegment, at: offset) }
+        pending.receivedBytes = offset + segmentLength
 
         if dataIn.statusPresent {
             // Phase-collapsed completion: no separate SCSI Response follows.
             pendingTasks.removeValue(forKey: dataIn.initiatorTaskTag)
             var result = SCSITaskResult(status: dataIn.status)
-            result.data = pending.readBuffer
             result.residualCount = dataIn.residualCount
             result.residualIsOverflow = dataIn.residualOverflow
-            var valid = pending.readBuffer.count
-            if dataIn.residualUnderflow {
-                valid -= Int(min(dataIn.residualCount, UInt32(pending.readBuffer.count)))
-                result.data = pending.readBuffer.prefix(valid)
-            }
-            if dataIn.status == 0x00 && pending.receivedBytes != valid {
-                let error = ConnectionError.protocolError(
-                    "read completed GOOD with \(pending.receivedBytes) of \(valid) bytes delivered")
-                pending.completion.complete(.failure(error))
-                throw error
-            }
+            result.data = try finishRead(pending, status: dataIn.status,
+                                         underflow: dataIn.residualUnderflow ? dataIn.residualCount : nil)
             pending.completion.complete(.success(result))
         }
     }
@@ -950,6 +1035,9 @@ public actor ISCSIConnection {
         guard state != .closed else { return }
         state = .closed
         closeReason = reason
+        // Whatever Data-In was part-way in stays where it got to: `drain`
+        // stops at the state it has just been given.
+        inbound = nil
         readLoop?.cancel()
         await transport.close()
 
