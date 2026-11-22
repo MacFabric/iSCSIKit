@@ -246,3 +246,46 @@ struct DeframerBufferTests {
         #expect(deframer.buffered == 0)
     }
 }
+
+@Suite("PDU serialization in parts")
+struct SerializePartsTests {
+    /// The parts, joined, are the PDU: with and without digests, at every
+    /// padding length, and when the data segment is a slice of something
+    /// larger.
+    @Test(arguments: [0, 1, 2, 3, 4, 5, 511, 512, 8191, 8192])
+    func partsJoinedAreThePDU(dataSize: Int) throws {
+        for digests in [DigestConfig(), DigestConfig(headerDigest: true, dataDigest: true),
+                        DigestConfig(headerDigest: false, dataDigest: true)] {
+            let buffer = Data((0 ..< dataSize + 9).map { UInt8(truncatingIfNeeded: $0 &* 13) })
+            var pdu = DataOutPDU()
+            pdu.initiatorTaskTag = 7
+            pdu.bufferOffset = 4096
+            pdu.dataSegment = buffer[9...]
+            let serializer = PDUSerializer(digests: digests)
+            let parts = serializer.serializeParts(pdu)
+            let joined = parts.reduce(into: Data()) { $0.append($1) }
+            #expect(joined == serializer.serialize(pdu))
+            #expect(!parts.contains { $0.isEmpty })
+
+            // And a deframer checking the same digests takes it back apart.
+            var deframer = PDUDeframer(digests: digests)
+            for part in parts { deframer.append(part) }
+            let raw = try #require(try deframer.next())
+            #expect(raw.data == Data(buffer[9...]))
+            #expect(try DataOutPDU(raw: raw).bufferOffset == 4096)
+            #expect(deframer.buffered == 0)
+        }
+    }
+
+    /// The data segment is the caller's buffer, not a copy of it.
+    @Test func theDataSegmentIsNotCopied() {
+        var pdu = DataOutPDU()
+        pdu.dataSegment = Data(repeating: 0x5A, count: 64 << 10)
+        let parts = PDUSerializer(digests: DigestConfig(headerDigest: true, dataDigest: true))
+            .serializeParts(pdu)
+        #expect(parts.count == 3)
+        let original = pdu.dataSegment.withUnsafeBytes { $0.baseAddress }
+        #expect(parts[1].withUnsafeBytes { $0.baseAddress } == original)
+        #expect(parts[2].count == 4, "no padding, so only the digest follows")
+    }
+}

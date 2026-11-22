@@ -225,9 +225,9 @@ public actor ISCSIBlockDevice: BlockDeviceBackend {
         try validate(offset: offset, length: data.count, blockSize: bs, capacity: count)
         let blocksPerChunk = max(1, maxTransferBytes / bs)
 
-        // Ranges, not payloads: materialising every chunk up front would copy
-        // the whole request before the first byte hit the wire. Each task
-        // slices (and `Data(...)`-normalises) its chunk when it sends it.
+        // Ranges, not payloads: each chunk is a slice of the caller's buffer
+        // all the way to the transport, so splitting a request copies none
+        // of it.
         var plan: [(lba: UInt64, bytes: Range<Data.Index>)] = []
         var lba = offset / UInt64(bs)
         var cursor = data.startIndex
@@ -244,14 +244,13 @@ public actor ISCSIBlockDevice: BlockDeviceBackend {
         // The common case should not pay for a one-member task group.
         if plan.count == 1 {
             try await writeChunk(lba: plan[0].lba,
-                                 payload: Data(data[plan[0].bytes]), blockSize: bs)
+                                 payload: data[plan[0].bytes], blockSize: bs)
             return
         }
 
-        // Bounded: unbounded submission holds a copy of most of the request
-        // (the CmdSN window does not cap it — tasks churn while their
-        // allocations stay), so a file copy would cost memory proportional to
-        // the file.
+        // Bounded: one request should not take the whole command window from
+        // every other (docs/queue-depth.md). It once bounded memory too, when
+        // each chunk was a copy.
         try await withThrowingTaskGroup(of: Void.self) { group in
             var next = 0
             func addNext() {
@@ -259,7 +258,7 @@ public actor ISCSIBlockDevice: BlockDeviceBackend {
                 next += 1
                 group.addTask { [self] in
                     try await writeChunk(lba: chunk.lba,
-                                         payload: Data(data[chunk.bytes]), blockSize: bs)
+                                         payload: data[chunk.bytes], blockSize: bs)
                 }
             }
             while next < min(Self.maxChunksInFlight, plan.count) { addNext() }
@@ -269,8 +268,7 @@ public actor ISCSIBlockDevice: BlockDeviceBackend {
         }
     }
 
-    /// Commands one request may have outstanding; caps a single request at
-    /// this many chunk copies regardless of its size.
+    /// Commands one request may have outstanding, whatever its size.
     static let maxChunksInFlight = 8
 
     /// One WRITE(16). On failure the group cancels its siblings, so which

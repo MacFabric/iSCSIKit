@@ -21,33 +21,46 @@ public struct PDUSerializer: Sendable {
         self.digests = digests
     }
 
-    public func serialize(_ raw: RawPDU) -> Data {
+    /// The PDU's wire bytes as up to three buffers, in order: the header
+    /// (BHS, AHS and HeaderDigest), the data segment exactly as the caller
+    /// holds it, and whatever follows it (padding, DataDigest). Sent with
+    /// `ConnectionTransport.send(contentsOf:)`, a megabyte of write data
+    /// reaches the socket without first being copied in behind its header.
+    public func serializeParts(_ raw: RawPDU) -> [Data] {
         precondition(raw.ahs.count % 4 == 0, "AHS must be 4-byte aligned")
-        var out = Data(capacity: 48 + raw.ahs.count + 8 + padded4(raw.data.count))
+        var head = Data(capacity: 48 + raw.ahs.count + 4)
         var bhs = raw.bhs
         bhs.setU8(UInt8(raw.ahs.count / 4), 4)
         bhs.setBE24(UInt32(raw.data.count), 5)
-        out.append(bhs)
-        out.append(raw.ahs)
+        head.append(bhs)
+        head.append(raw.ahs)
         if digests.headerDigest {
-            out.append(CRC32C.wireDigest(out))
+            head.append(CRC32C.wireDigest(head))
         }
-        if !raw.data.isEmpty {
-            let padLen = padded4(raw.data.count) - raw.data.count
-            out.append(raw.data)
-            if padLen > 0 { out.append(Data(count: padLen)) }
-            if digests.dataDigest {
-                // Chained over segment then pad: concatenating first copied
-                // the whole data segment just to compute four bytes.
-                var crc = CRC32C.initial
-                crc = raw.data.withUnsafeBytes { CRC32C.update(crc, $0) }
-                if padLen > 0 {
-                    let pad = [UInt8](repeating: 0, count: padLen)
-                    crc = pad.withUnsafeBytes { CRC32C.update(crc, $0) }
-                }
-                out.append(CRC32C.wireBytes(CRC32C.finalize(crc)))
-            }
+        guard !raw.data.isEmpty else { return [head] }
+
+        let padLen = padded4(raw.data.count) - raw.data.count
+        var tail = Data(count: padLen)
+        if digests.dataDigest {
+            // Chained over segment then pad, without joining them.
+            var crc = CRC32C.initial
+            crc = raw.data.withUnsafeBytes { CRC32C.update(crc, $0) }
+            crc = tail.withUnsafeBytes { CRC32C.update(crc, $0) }
+            tail.append(CRC32C.wireBytes(CRC32C.finalize(crc)))
         }
+        return tail.isEmpty ? [head, raw.data] : [head, raw.data, tail]
+    }
+
+    public func serializeParts(_ pdu: some ProtocolDataUnit) -> [Data] {
+        serializeParts(pdu.encode())
+    }
+
+    /// The same bytes as one buffer, which costs a copy of the data segment.
+    public func serialize(_ raw: RawPDU) -> Data {
+        let parts = serializeParts(raw)
+        if parts.count == 1 { return parts[0] }
+        var out = Data(capacity: parts.reduce(0) { $0 + $1.count })
+        for part in parts { out.append(part) }
         return out
     }
 

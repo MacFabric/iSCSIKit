@@ -139,7 +139,7 @@ public actor ISCSIConnection {
                 await close(reason: .loginFailed(error))
                 throw ConnectionError.loginFailed(error)
             }
-            try await sendRaw(serializer.serialize(request))
+            try await sendRaw(serializer.serializeParts(request))
             let response = try await receiveLoginResponse()
             let outcome: LoginStateMachine.Outcome
             do {
@@ -220,6 +220,9 @@ public actor ISCSIConnection {
         command.cmdSN = cmdSN
         command.expStatSN = expStatSN
 
+        // A slice of the caller's buffer, like every other piece of write
+        // data from here to the transport: nothing below copies it, and
+        // nothing may index it from zero.
         var unsolicitedTail = Data()
         switch task.direction {
         case .none:
@@ -237,20 +240,22 @@ public actor ISCSIConnection {
             var offset = 0
             if parameters.immediateData && !data.isEmpty {
                 let n = min(firstBurst, targetMRDSL, data.count)
-                command.dataSegment = data.prefix(n)
+                command.dataSegment = data.sub(0, n)
                 offset = n
             }
-            if parameters.canSendUnsolicitedDataOut && offset < min(firstBurst, data.count) {
-                unsolicitedTail = data.subdata(in: offset ..< min(firstBurst, data.count))
+            let unsolicitedEnd = min(firstBurst, data.count)
+            if parameters.canSendUnsolicitedDataOut && offset < unsolicitedEnd {
+                unsolicitedTail = data.sub(offset, unsolicitedEnd - offset)
             }
             command.final = unsolicitedTail.isEmpty
         }
 
         cmdSN &+= 1
-        try await sendRaw(serializer.serialize(command))
-
+        // The command and its unsolicited Data-Out go out as one send: one
+        // wait for the transport instead of one per PDU.
+        var wire = serializer.serializeParts(command)
         if !unsolicitedTail.isEmpty {
-            try await sendDataOutSequence(
+            wire += dataOutSequence(
                 itt: itt,
                 lun: task.lun,
                 ttt: 0xFFFF_FFFF,
@@ -258,6 +263,7 @@ public actor ISCSIConnection {
                 bufferOffsetBase: UInt32(command.dataSegment.count)
             )
         }
+        try await sendRaw(wire)
 
         return try await withTaskCancellationHandler {
             try await suspend(pending.completion)
@@ -287,7 +293,7 @@ public actor ISCSIConnection {
         nop.cmdSN = cmdSN // immediate: window not consumed
         nop.expStatSN = expStatSN
         nop.dataSegment = payload
-        try await sendRaw(serializer.serialize(nop))
+        try await sendRaw(serializer.serializeParts(nop))
         try await withTaskCancellationHandler {
             try await suspend(completion)
         } onCancel: {
@@ -331,7 +337,7 @@ public actor ISCSIConnection {
         }
         tmf.cmdSN = cmdSN
         tmf.expStatSN = expStatSN
-        try await sendRaw(serializer.serialize(tmf))
+        try await sendRaw(serializer.serializeParts(tmf))
         return try await suspend(completion)
     }
 
@@ -351,7 +357,7 @@ public actor ISCSIConnection {
         req.expStatSN = expStatSN
         req.dataSegment = params.encode()
         cmdSN &+= 1
-        try await sendRaw(serializer.serialize(req))
+        try await sendRaw(serializer.serializeParts(req))
         return try await suspend(completion)
     }
 
@@ -368,7 +374,7 @@ public actor ISCSIConnection {
         req.cid = loginConfig.cid
         req.cmdSN = cmdSN
         req.expStatSN = expStatSN
-        try await sendRaw(serializer.serialize(req))
+        try await sendRaw(serializer.serializeParts(req))
         let response = try await suspend(completion)
         await close(reason: .closed)
         return response
@@ -437,14 +443,48 @@ public actor ISCSIConnection {
     /// CmdSN n+1 ahead of n, which RFC 7143 §4.2.2.1 says MUST NOT happen.
     private var lastSend: Task<Void, any Error>?
 
-    private func sendRaw(_ bytes: Data) async throws {
+    /// Take the next place in the send order for `parts`, which go out as
+    /// one run of bytes. Synchronous, so the order sends are queued in is the
+    /// order this actor decided on.
+    private func enqueueSend(_ parts: [Data]) -> Task<Void, any Error> {
         let previous = lastSend
         let transport = self.transport
         let send = Task {
             _ = await previous?.result
-            try await transport.send(bytes)
+            try await transport.send(contentsOf: parts)
         }
         lastSend = send
+        return send
+    }
+
+    /// Queue `parts` and return without waiting for the transport to take
+    /// them. For what the read loop sends in answer to the target — Data-Out
+    /// for an R2T, the echo of a NOP-In. Waiting there stopped the loop
+    /// receiving for as long as the send took, which against a full send
+    /// buffer is as long as the network takes to drain it: no Data-In, no
+    /// status and no window update for any other command meanwhile.
+    ///
+    /// Nothing is lost by not waiting. The bytes are slices of buffers their
+    /// commands already hold, so no memory is added; a send that fails closes
+    /// the connection exactly as an awaited one does; and one that never
+    /// completes is ended, as before, by whoever closes the connection — the
+    /// task's deadline or the keepalive.
+    private func sendWithoutWaiting(_ parts: [Data]) {
+        let previous = lastSend
+        let transport = self.transport
+        lastSend = Task { [weak self] in
+            _ = await previous?.result
+            do {
+                try await transport.send(contentsOf: parts)
+            } catch {
+                await self?.close(reason: .connectionLost("send failed: \(error)"))
+                throw error
+            }
+        }
+    }
+
+    private func sendRaw(_ parts: [Data]) async throws {
+        let send = enqueueSend(parts)
         do {
             // Cancellation still reaches the transport, which tears a stuck
             // send down (and with it the connection) rather than block every
@@ -502,10 +542,10 @@ public actor ISCSIConnection {
             try handleDataIn(dataIn)
         case .r2t(let r2t):
             updateWindow(expCmdSN: r2t.expCmdSN, maxCmdSN: r2t.maxCmdSN)
-            try await handleR2T(r2t)
+            try handleR2T(r2t)
         case .nopIn(let nop):
             updateWindow(expCmdSN: nop.expCmdSN, maxCmdSN: nop.maxCmdSN)
-            try await handleNopIn(nop)
+            try handleNopIn(nop)
         case .tmfResponse(let resp):
             try advanceStatSN(resp.statSN)
             updateWindow(expCmdSN: resp.expCmdSN, maxCmdSN: resp.maxCmdSN)
@@ -662,7 +702,7 @@ public actor ISCSIConnection {
         }
     }
 
-    private func handleR2T(_ r2t: R2TPDU) async throws {
+    private func handleR2T(_ r2t: R2TPDU) throws {
         guard let pending = pendingTasks[r2t.initiatorTaskTag] else {
             throw ConnectionError.protocolError("R2T for unknown ITT \(r2t.initiatorTaskTag)")
         }
@@ -688,25 +728,30 @@ public actor ISCSIConnection {
         }
         // A terminated task still answers its R2Ts: the target must collect
         // the solicited data before it can complete the abort (§11.5).
-        try await sendDataOutSequence(
+        //
+        // Queued whole and not waited for; see `sendWithoutWaiting`.
+        sendWithoutWaiting(dataOutSequence(
             itt: r2t.initiatorTaskTag,
             lun: pending.task.lun,
             ttt: r2t.targetTransferTag,
-            data: data.subdata(in: start ..< start + length),
+            data: data.sub(start, length),
             bufferOffsetBase: r2t.bufferOffset
-        )
+        ))
     }
 
-    /// One Data-Out sequence (unsolicited tail or an R2T answer), chunked to
-    /// the target's MaxRecvDataSegmentLength, DataSN starting at 0.
-    private func sendDataOutSequence(
+    /// The wire bytes of one Data-Out sequence (unsolicited tail or an R2T
+    /// answer), chunked to the target's MaxRecvDataSegmentLength, DataSN
+    /// starting at 0. Built whole so the sequence is one send; `data` may be
+    /// a slice, and its bytes are referenced, not copied.
+    private func dataOutSequence(
         itt: UInt32,
         lun: UInt64,
         ttt: UInt32,
         data: Data,
         bufferOffsetBase: UInt32
-    ) async throws {
+    ) -> [Data] {
         let chunkSize = max(1, Int(parameters.targetMaxRecvDataSegmentLength))
+        var wire: [Data] = []
         var dataSN: UInt32 = 0
         var offset = 0
         while offset < data.count {
@@ -718,15 +763,16 @@ public actor ISCSIConnection {
             out.expStatSN = expStatSN
             out.dataSN = dataSN
             out.bufferOffset = bufferOffsetBase + UInt32(offset)
-            out.dataSegment = data.subdata(in: offset ..< end)
+            out.dataSegment = data.sub(offset, end - offset)
             out.final = end == data.count
-            try await sendRaw(serializer.serialize(out))
+            wire += serializer.serializeParts(out)
             dataSN &+= 1
             offset = end
         }
+        return wire
     }
 
-    private func handleNopIn(_ nop: NopInPDU) async throws {
+    private func handleNopIn(_ nop: NopInPDU) throws {
         if nop.initiatorTaskTag != 0xFFFF_FFFF {
             // Echo of one of our pings — but only if we actually sent one.
             if let completion = pendingPings.removeValue(forKey: nop.initiatorTaskTag) {
@@ -750,7 +796,9 @@ public actor ISCSIConnection {
             reply.expStatSN = expStatSN
             reply.dataSegment = Data(
                 nop.dataSegment.prefix(Int(parameters.targetMaxRecvDataSegmentLength)))
-            try await sendRaw(serializer.serialize(reply))
+            // Not waited for either: it queues behind any Data-Out already
+            // on its way, and the loop must keep receiving meanwhile.
+            sendWithoutWaiting(serializer.serializeParts(reply))
         }
         // Else: both tags reserved — a pure ExpCmdSN/MaxCmdSN update
         // (§11.19.1); the window was already folded in by handle().
@@ -788,7 +836,7 @@ public actor ISCSIConnection {
             req.cmdSN = cmdSN
             req.expStatSN = expStatSN
             cmdSN &+= 1
-            try await sendRaw(serializer.serialize(req))
+            try await sendRaw(serializer.serializeParts(req))
         } else {
             pendingText.removeValue(forKey: resp.initiatorTaskTag)
             do {
@@ -816,7 +864,7 @@ public actor ISCSIConnection {
         req.cid = loginConfig.cid
         req.cmdSN = cmdSN
         req.expStatSN = expStatSN
-        try await sendRaw(serializer.serialize(req))
+        try await sendRaw(serializer.serializeParts(req))
 
         let seconds = deadlineSeconds == 0 ? 5 : Int(min(deadlineSeconds, 30))
         let limit = Duration.seconds(seconds)
