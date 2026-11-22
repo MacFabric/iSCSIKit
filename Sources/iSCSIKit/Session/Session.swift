@@ -114,6 +114,11 @@ public actor ISCSISession {
                 try await recover(after: error, on: connection)
             } catch is DeadlineError {
                 try Task.checkCancellation()
+                // The task is still outstanding on that connection, which may
+                // yet receive data for it. Closed first, and waited for: a
+                // retry reads into the same buffer, and nothing may still be
+                // writing there. Recovery would close it anyway.
+                await connection.close()
                 // The deadline aborted the task at the target. Re-login rather
                 // than resubmit on the same connection; when retries run out,
                 // drop the connection so the next caller starts fresh instead
