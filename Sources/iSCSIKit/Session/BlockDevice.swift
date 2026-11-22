@@ -167,50 +167,52 @@ public actor ISCSIBlockDevice: BlockDeviceBackend {
         }
 
         // Several commands, issued concurrently: sequential chunks would make
-        // splitting strictly worse than not splitting. Chunks are independent
-        // and reassembled by index, so completion order is irrelevant.
-        var plan: [(index: Int, lba: UInt64, blocks: Int)] = []
+        // splitting strictly worse than not splitting. Each is given its own
+        // part of one buffer and receives into it, so the pieces arrive
+        // already in place and completion order is irrelevant.
+        let buffer = ReadBuffer(count: length)
+        var plan: [(lba: UInt64, blocks: Int, region: ReadBuffer.Region)] = []
         var lba = firstLBA
         var remaining = totalBlocks
         while remaining > 0 {
             let blocks = min(remaining, blocksPerChunk)
-            plan.append((plan.count, lba, blocks))
+            plan.append((lba, blocks, ReadBuffer.Region(
+                buffer: buffer, offset: Int(lba - firstLBA) * bs, count: blocks * bs)))
             lba += UInt64(blocks)
             remaining -= blocks
         }
 
-        let parts = try await withThrowingTaskGroup(
-            of: (Int, Data).self, returning: [Int: Data].self
-        ) { group in
+        try await withThrowingTaskGroup(of: Void.self) { group in
             for chunk in plan {
                 group.addTask { [self] in
-                    (chunk.index, try await readChunk(lba: chunk.lba,
-                                                      blocks: chunk.blocks,
-                                                      blockSize: bs))
+                    _ = try await readChunk(lba: chunk.lba, blocks: chunk.blocks,
+                                            blockSize: bs, into: chunk.region)
                 }
             }
-            var collected: [Int: Data] = [:]
-            for try await (index, data) in group { collected[index] = data }
-            return collected
+            try await group.waitForAll()
         }
-
-        var out = Data(capacity: length)
-        for chunk in plan {
-            guard let part = parts[chunk.index] else { throw BlockDeviceError.notReady }
-            out.append(part)
-        }
-        return out
+        return buffer.data()
     }
 
-    private func readChunk(lba: UInt64, blocks: Int, blockSize bs: Int) async throws -> Data {
+    /// One READ(16). With `region`, the data is received there and the
+    /// returned `Data` is empty; the command must then deliver all of it,
+    /// because a short piece in the middle of a larger read has nowhere to
+    /// be reported. Without, the result is the command's own buffer, short
+    /// if the target said so.
+    private func readChunk(lba: UInt64, blocks: Int, blockSize bs: Int,
+                           into region: ReadBuffer.Region? = nil) async throws -> Data {
         let result = try await executeRetryingTransientStatus(SCSITask(
             lun: lunAddress,
             cdb: CDB.read16(lba: lba, blocks: UInt32(blocks)),
-            direction: .read(expectedLength: UInt32(blocks * bs))
+            direction: .read(expectedLength: UInt32(blocks * bs)),
+            readDestination: region
         ))
         guard result.isGood else {
             throw BlockDeviceError.scsiError(
                 status: result.status, sense: result.sense.flatMap(SenseData.init))
+        }
+        if region != nil, result.residualCount != 0, !result.residualIsOverflow {
+            throw BlockDeviceError.notReady
         }
         return result.data
     }

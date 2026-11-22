@@ -13,7 +13,7 @@ let package = Package(
     ],
     dependencies: [
         // Up to the next minor: before 1.0 a minor release may break API.
-        .package(url: "https://github.com/MacFabric/FabricKit", .upToNextMinor(from: "0.1.1")),
+        .package(url: "https://github.com/MacFabric/FabricKit", .upToNextMinor(from: "0.1.2")),
     ],
     targets: [
         // Pure protocol logic. No sockets of its own and no side effects:

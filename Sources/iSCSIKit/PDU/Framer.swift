@@ -72,20 +72,43 @@ public struct PDUSerializer: Sendable {
 /// Incremental deframer: feed arbitrary byte chunks, pull complete PDUs.
 /// Verifies digests and enforces a data-segment length limit (protects the
 /// receive path from a hostile/broken peer allocating unbounded memory).
+///
+/// Two ways to pull. `next()` returns a whole PDU once all of it has
+/// arrived, its data segment copied out once. The other takes a PDU in
+/// steps, for a receiver that knows where the data belongs: `nextHead()`
+/// returns the header as soon as that has arrived, and then the data segment
+/// is moved with `readData(into:)` straight from the chunks it came in to
+/// the buffer of the read it answers, piece by piece as it arrives, and
+/// closed with `finishData()`. Bytes go from the transport's chunk to their
+/// destination and are never copied in between.
+///
+/// On a thrown error the deframer state is poisoned — at ERL0 any framing or
+/// digest error tears down the connection, so no resync is attempted.
 public struct PDUDeframer: Sendable {
     public var digests: DigestConfig
     /// Upper bound accepted for DataSegmentLength; our negotiated
     /// MaxRecvDataSegmentLength plus slack for login-phase PDUs.
     public var maxDataSegmentLength: Int
 
-    private var buffer = Data()
-    /// Bytes at the front of `buffer` already handed out as PDUs. Consuming
-    /// via `removeFirst` per PDU would be quadratic; an index is O(1), and the
-    /// front is reclaimed in one copy once large enough.
-    private var consumed = 0
+    /// Received and not yet consumed. Chunks are kept as they arrived and
+    /// released as they are used up, so nothing here grows with the bytes
+    /// that have passed through.
+    private var queue = ReceiveQueue()
 
-    /// Compact once the dead prefix exceeds this, or half the buffer.
-    private static let compactThreshold = 64 * 1024
+    /// A data segment whose header `nextHead()` has returned and which has
+    /// not been closed yet.
+    private struct Segment: Sendable {
+        /// Data bytes still to be taken.
+        var remaining: Int
+        let padLength: Int
+        /// Running digest over the bytes taken so far, when one is checked.
+        var crc: UInt32
+        let checked: Bool
+        /// Bytes after the data: padding, then the digest.
+        var trailerLength: Int { padLength + (checked ? 4 : 0) }
+    }
+
+    private var segment: Segment?
 
     public init(digests: DigestConfig = DigestConfig(), maxDataSegmentLength: Int = 1 << 24) {
         self.digests = digests
@@ -93,78 +116,152 @@ public struct PDUDeframer: Sendable {
     }
 
     public mutating func append(_ bytes: Data) {
-        compactIfNeeded()
-        buffer.append(bytes)
+        queue.append(bytes)
     }
 
-    /// Bytes buffered but not yet consumed as a complete PDU.
-    public var buffered: Int { buffer.count - consumed }
+    /// Bytes buffered but not yet consumed.
+    public var buffered: Int { queue.count }
 
-    /// Reclaim the dead prefix by copying the live tail into a fresh buffer.
-    ///
-    /// **Must not use `removeFirst`**: `Data` is a slice type, so that keeps
-    /// the original backing store and RSS grows 1:1 with every byte ever
-    /// received on the connection. A fresh `Data` forces a real copy and
-    /// drops the last reference to the old store.
-    private mutating func compactIfNeeded() {
-        guard consumed > 0 else { return }
-        guard consumed >= Self.compactThreshold || consumed * 2 >= buffer.count else { return }
-        if consumed >= buffer.count {
-            buffer = Data()
-        } else {
-            var fresh = Data(capacity: buffer.count - consumed)
-            fresh.append(contentsOf: buffer[(buffer.startIndex + consumed)...])
-            buffer = fresh
-        }
-        consumed = 0
+    /// A PDU's header, with the length of the data segment that follows it.
+    public struct Head: Sendable {
+        /// Exactly 48 bytes.
+        public let bhs: Data
+        public let ahs: Data
+        public let dataLength: Int
     }
 
-    /// Returns the next complete PDU, or nil if more bytes are needed.
-    /// On a thrown error the deframer state is poisoned — at ERL0 any framing
-    /// or digest error tears down the connection, so no resync is attempted.
-    public mutating func next() throws -> RawPDU? {
-        let avail = buffer.count - consumed
-        guard avail >= 48 else { return nil }
-
-        let ahsLen = Int(buffer.u8(consumed + 4)) * 4
-        let dataLen = Int(buffer.beU24(consumed + 5))
+    /// The header at the front of the queue, parsed far enough to know how
+    /// long it and its data are. nil until its first 48 bytes have arrived.
+    private func lengths() throws -> (header: Int, data: Int)? {
+        guard queue.count >= 48 else { return nil }
+        let ahsLen = Int(queue.byte(at: 4)) * 4
+        let dataLen = Int(queue.byte(at: 5)) << 16 | Int(queue.byte(at: 6)) << 8 | Int(queue.byte(at: 7))
         guard dataLen <= maxDataSegmentLength else {
             throw PDUError.dataSegmentTooLarge(length: dataLen, limit: maxDataSegmentLength)
         }
+        return (48 + ahsLen, dataLen)
+    }
 
-        let headerLen = 48 + ahsLen
+    /// Copy the header out and check its digest. Consumes nothing.
+    private func header(length: Int) throws -> (bhs: Data, ahs: Data) {
+        let bhs = queue.peek(48)
+        let ahs = length > 48 ? queue.peek(length - 48, skippingFirst: 48) : Data()
+        if digests.headerDigest {
+            var crc = bhs.withUnsafeBytes { CRC32C.update(CRC32C.initial, $0) }
+            crc = ahs.withUnsafeBytes { CRC32C.update(crc, $0) }
+            guard CRC32C.finalize(crc) == wireDigestValue(at: length) else {
+                throw PDUError.headerDigestMismatch
+            }
+        }
+        return (bhs, ahs)
+    }
+
+    /// Returns the next complete PDU, or nil if more bytes are needed.
+    public mutating func next() throws -> RawPDU? {
+        precondition(segment == nil, "a data segment begun with nextHead() has not been finished")
+        guard let (headerLen, dataLen) = try lengths() else { return nil }
         let headerDigestLen = digests.headerDigest ? 4 : 0
         let paddedData = padded4(dataLen)
         let dataDigestLen = (digests.dataDigest && dataLen > 0) ? 4 : 0
         let total = headerLen + headerDigestLen + paddedData + dataDigestLen
-        guard avail >= total else { return nil }
+        guard queue.count >= total else { return nil }
 
-        if digests.headerDigest {
-            let expected = CRC32C.checksum(buffer.sub(consumed, headerLen))
-            let onWire = wireDigestValue(at: consumed + headerLen)
-            guard expected == onWire else { throw PDUError.headerDigestMismatch }
-        }
-        let dataStart = consumed + headerLen + headerDigestLen
+        let (bhs, ahs) = try header(length: headerLen)
+        let dataStart = headerLen + headerDigestLen
+        let data = queue.peek(dataLen, skippingFirst: dataStart)
         if dataDigestLen > 0 {
-            let expected = CRC32C.checksum(buffer.sub(dataStart, paddedData))
-            let onWire = wireDigestValue(at: dataStart + paddedData)
-            guard expected == onWire else { throw PDUError.dataDigestMismatch }
+            var crc = data.withUnsafeBytes { CRC32C.update(CRC32C.initial, $0) }
+            let pad = queue.peek(paddedData - dataLen, skippingFirst: dataStart + dataLen)
+            crc = pad.withUnsafeBytes { CRC32C.update(crc, $0) }
+            guard CRC32C.finalize(crc) == wireDigestValue(at: dataStart + paddedData) else {
+                throw PDUError.dataDigestMismatch
+            }
         }
-
-        let raw = RawPDU(
-            bhs: Data(buffer.sub(consumed, 48)),
-            ahs: Data(buffer.sub(consumed + 48, ahsLen)),
-            data: Data(buffer.sub(dataStart, dataLen))
-        )
-        consumed += total
-        return raw
+        queue.skip(total)
+        return RawPDU(bhs: bhs, ahs: ahs, data: data)
     }
 
-    /// Little-endian digest value at `offset`.
+    // MARK: - A PDU in steps
+
+    /// The next PDU's header, consumed with its digest, or nil if it has not
+    /// all arrived. When `dataLength` is not zero the data segment must be
+    /// taken — `readData(into:)` then `finishData()`, or `takeData()` —
+    /// before this is called again.
+    public mutating func nextHead() throws -> Head? {
+        precondition(segment == nil, "the previous PDU's data segment has not been finished")
+        guard let (headerLen, dataLen) = try lengths() else { return nil }
+        let headerDigestLen = digests.headerDigest ? 4 : 0
+        guard queue.count >= headerLen + headerDigestLen else { return nil }
+        let (bhs, ahs) = try header(length: headerLen)
+        queue.skip(headerLen + headerDigestLen)
+        if dataLen > 0 {
+            segment = Segment(remaining: dataLen, padLength: padded4(dataLen) - dataLen,
+                              crc: CRC32C.initial, checked: digests.dataDigest)
+        }
+        return Head(bhs: bhs, ahs: ahs, dataLength: dataLen)
+    }
+
+    /// Data-segment bytes not yet taken.
+    public var dataRemaining: Int { segment?.remaining ?? 0 }
+
+    /// Move data-segment bytes that have arrived into `destination`: as many
+    /// as it holds, as remain in the segment, and as are buffered, whichever
+    /// is least. Returns how many. They are not known to be good until
+    /// `finishData()` has checked the digest.
+    @discardableResult
+    public mutating func readData(into destination: UnsafeMutableRawBufferPointer) -> Int {
+        guard var current = segment, current.remaining > 0, destination.count > 0 else { return 0 }
+        let room = UnsafeMutableRawBufferPointer(
+            rebasing: destination[0 ..< min(current.remaining, destination.count)])
+        let moved = queue.read(into: room)
+        if current.checked, moved > 0 {
+            current.crc = CRC32C.update(current.crc, UnsafeRawBufferPointer(rebasing: room[0 ..< moved]))
+        }
+        current.remaining -= moved
+        segment = current
+        return moved
+    }
+
+    /// Close the data segment once all of it has been taken: consume its
+    /// padding and check its digest. false if those bytes have not arrived.
+    public mutating func finishData() throws -> Bool {
+        guard let current = segment else { return true }
+        precondition(current.remaining == 0, "data segment bytes not yet taken")
+        guard queue.count >= current.trailerLength else { return false }
+        if current.checked {
+            let pad = queue.peek(current.padLength)
+            let crc = pad.withUnsafeBytes { CRC32C.update(current.crc, $0) }
+            guard CRC32C.finalize(crc) == wireDigestValue(at: current.padLength) else {
+                throw PDUError.dataDigestMismatch
+            }
+        }
+        queue.skip(current.trailerLength)
+        segment = nil
+        return true
+    }
+
+    /// The whole data segment as one buffer, checked and closed, for a PDU
+    /// whose data has nowhere better to go. nil until all of it has arrived.
+    /// Not to be mixed with `readData(into:)` on the same segment.
+    public mutating func takeData() throws -> Data? {
+        guard var current = segment else { return Data() }
+        guard queue.count >= current.remaining + current.trailerLength else { return nil }
+        let data = queue.read(current.remaining)
+        if current.checked {
+            current.crc = data.withUnsafeBytes { CRC32C.update(current.crc, $0) }
+        }
+        current.remaining = 0
+        segment = current
+        _ = try finishData()
+        return data
+    }
+
+    /// Little-endian digest value `offset` bytes into the queue.
     private func wireDigestValue(at offset: Int) -> UInt32 {
-        UInt32(buffer.u8(offset))
-            | UInt32(buffer.u8(offset + 1)) << 8
-            | UInt32(buffer.u8(offset + 2)) << 16
-            | UInt32(buffer.u8(offset + 3)) << 24
+        let bytes = queue.peek(4, skippingFirst: offset)
+        return UInt32(bytes.u8(0))
+            | UInt32(bytes.u8(1)) << 8
+            | UInt32(bytes.u8(2)) << 16
+            | UInt32(bytes.u8(3)) << 24
     }
 }

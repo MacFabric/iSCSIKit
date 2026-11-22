@@ -12,17 +12,27 @@ public struct SCSITask: Sendable {
     public var cdb: Data
     public var direction: Direction
     public var attribute: SCSICommandPDU.TaskAttribute
+    /// Where a read's data goes, when the caller has memory waiting for it:
+    /// a region at least `expectedLength` long, typically one command's part
+    /// of a buffer a large read shares between its commands. The task's
+    /// result then carries no `data` of its own; the bytes are in the region,
+    /// as many of them as `SCSITaskResult.data` would have held, and any the
+    /// target did not deliver are zeroed. nil: the connection allocates, and
+    /// the result's `data` is that memory, not a copy of it.
+    public var readDestination: ReadBuffer.Region?
 
     public init(
         lun: UInt64,
         cdb: Data,
         direction: Direction = .none,
-        attribute: SCSICommandPDU.TaskAttribute = .simple
+        attribute: SCSICommandPDU.TaskAttribute = .simple,
+        readDestination: ReadBuffer.Region? = nil
     ) {
         self.lun = lun
         self.cdb = cdb
         self.direction = direction
         self.attribute = attribute
+        self.readDestination = readDestination
     }
 
     /// The 64-bit LUN field for a LUN number (SAM-2): single-level peripheral
