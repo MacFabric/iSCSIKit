@@ -1,13 +1,13 @@
 {
-  "originHash" : "b05ab5ad54092558e7637db5e479980ce86dd0e03591b413feee68c59389e5dc",
+  "originHash" : "2a8938e0a96489728e9c7469cefd5f25dfaf404f00859d6979abd9eacade387f",
   "pins" : [
     {
       "identity" : "fabrickit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/MacFabric/FabricKit",
       "state" : {
-        "revision" : "b521ccd4903dca0b44d37264c88a658e67e71b82",
-        "version" : "0.1.1"
+        "revision" : "6b5a7b1f347698aa91b14654495f1a4383163da7",
+        "version" : "0.1.2"
       }
     }
   ],
