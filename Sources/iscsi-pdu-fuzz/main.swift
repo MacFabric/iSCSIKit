@@ -32,12 +32,56 @@ private func stateless(_ data: Data) {
     for digests in [DigestConfig(), DigestConfig(headerDigest: true, dataDigest: true)] {
         var deframer = PDUDeframer(digests: digests, maxDataSegmentLength: 1 << 20)
         deframer.append(data)
+        var whole: [RawPDU] = []
         while let raw = try? deframer.next() {
+            whole.append(raw)
             if let pdu = try? AnyPDU.decode(raw) {
                 // Re-encode of a decoded PDU must never crash.
                 _ = pdu.encode()
             }
         }
+        // The same bytes taken in steps, fed in two pieces cut wherever the
+        // input's first byte says: the read loop's path. It must not crash,
+        // and must find the PDUs `next()` found, in order, until the first
+        // one either of them refuses.
+        var steps = PDUDeframer(digests: digests, maxDataSegmentLength: 1 << 20)
+        let cut = data.isEmpty ? 0 : Int(data[data.startIndex]) % (data.count + 1)
+        var stepped: [RawPDU] = []
+        var head: PDUDeframer.Head?
+        var body = Data()
+        var piece = [UInt8](repeating: 0, count: 61)
+        var failed = false
+        for part in [data.prefix(cut), data.dropFirst(cut)] where !failed {
+            steps.append(part)
+            pump: while true {
+                do {
+                    if head == nil {
+                        guard let next = try steps.nextHead() else { break pump }
+                        head = next
+                        body = Data()
+                    }
+                    guard let current = head else { break pump }
+                    if current.dataLength % 2 == 0 {
+                        guard let taken = try steps.takeData() else { break pump }
+                        body = taken
+                    } else {
+                        while steps.dataRemaining > 0 {
+                            let moved = piece.withUnsafeMutableBytes { steps.readData(into: $0) }
+                            if moved == 0 { break pump }
+                            body.append(contentsOf: piece[0 ..< moved])
+                        }
+                        guard try steps.finishData() else { break pump }
+                    }
+                    stepped.append(RawPDU(bhs: current.bhs, ahs: current.ahs, data: body))
+                    head = nil
+                } catch {
+                    failed = true
+                    break pump
+                }
+            }
+        }
+        precondition(stepped.count >= whole.count && Array(stepped.prefix(whole.count)) == whole,
+                     "deframing in steps disagrees with next()")
     }
     _ = try? TextParameters.decode(data)
     // Target-controlled SCSI payloads. Data's accessors trap on an
