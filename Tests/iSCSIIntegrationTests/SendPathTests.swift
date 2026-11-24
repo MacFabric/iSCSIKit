@@ -131,7 +131,9 @@ struct SendPathTests {
         let result = try await withDeadline(.seconds(5)) { try await read.value }
         #expect(result.isGood)
         #expect(result.data == stored)
-        #expect(transport.dataOut.everHeld == 1, "the R2T answer should be the send in the gate")
+        // The R2T answer is sent from its own task, so it can reach the gate
+        // after the read is done; until the gate opens it cannot have left.
+        await eventually("the R2T answer reached the transport") { transport.dataOut.everHeld == 1 }
 
         transport.dataOut.release()
         let written = try await withDeadline(.seconds(5)) { try await write.value }
