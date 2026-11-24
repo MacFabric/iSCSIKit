@@ -14,6 +14,13 @@ struct StallResilienceTests {
         return config
     }
 
+    /// For a session that must also complete a command: the task deadline is
+    /// the session's, shared by every command on it, and with the whole suite
+    /// running in parallel a healthy TEST UNIT READY against the in-memory
+    /// target took up to 565 ms (measured 2026-11-24). 200 ms suits only a
+    /// session whose every command is meant to stall.
+    private static let healthyTimeout: Duration = .seconds(2)
+
     private func policy(retries: Int = 1, timeout: Duration = .milliseconds(200)) -> SessionPolicy {
         var policy = testPolicy(retries: retries)
         policy.taskTimeout = timeout
@@ -37,7 +44,8 @@ struct StallResilienceTests {
         // The timeout is not just fail-fast: the retry lands on a re-login, so
         // a target that comes back is picked up without the caller noticing.
         let fleet = TargetFleet(disk: RAMDisk(), configs: [stallingConfig(), MockTargetConfig()])
-        let session = ISCSISession(login: standardLogin(), policy: policy(retries: 2)) {
+        let session = ISCSISession(login: standardLogin(),
+                                   policy: policy(retries: 2, timeout: Self.healthyTimeout)) {
             await fleet.makeTransport()
         }
         try await session.activate()
@@ -54,7 +62,8 @@ struct StallResilienceTests {
         let fleet = TargetFleet(disk: RAMDisk(), configs: [
             stallingConfig(), stallingConfig(), MockTargetConfig(),
         ])
-        let session = ISCSISession(login: standardLogin(), policy: policy(retries: 0)) {
+        let session = ISCSISession(login: standardLogin(),
+                                   policy: policy(retries: 0, timeout: Self.healthyTimeout)) {
             await fleet.makeTransport()
         }
         try await session.activate()
@@ -149,7 +158,8 @@ extension StallResilienceTests {
     @Test func stalledSendFailsInsteadOfHangingForever() async throws {
         let fleet = TargetFleet(disk: RAMDisk(), configs: [MockTargetConfig()])
         let stall = StallingSendTransport.Switch()
-        let session = ISCSISession(login: standardLogin(), policy: policy(retries: 0)) {
+        let session = ISCSISession(login: standardLogin(),
+                                   policy: policy(retries: 0, timeout: Self.healthyTimeout)) {
             StallingSendTransport(wrapping: await fleet.makeTransport(), stall: stall)
         }
         try await session.activate()
