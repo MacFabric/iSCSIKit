@@ -178,10 +178,10 @@ struct HappyPathTests {
         targetConfig.faults.nopPingOnConnect = true
         let (connection, harness, _) = try await loggedInConnection(targetConfig: targetConfig)
         // Drive some traffic so the echo lands, then check the target saw it.
+        // The echo is sent from its own task, so it is polled for, not slept on.
         _ = try await connection.execute(SCSITask(lun: 0, cdb: CDB.testUnitReady()))
-        try await Task.sleep(for: .milliseconds(50))
-        let echoes = await harness.target.pingEchoes
-        #expect(echoes == [Data("mock-ping".utf8)])
+        #expect(await eventually { await !harness.target.pingEchoes.isEmpty })
+        #expect(await harness.target.pingEchoes == [Data("mock-ping".utf8)])
         await harness.finish()
     }
 

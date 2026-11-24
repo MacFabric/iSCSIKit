@@ -184,21 +184,26 @@ struct HostileTargetTests {
 
     // MARK: Stalls and timeouts
 
-    @Test func timedOutCommandIsAutoAborted() async throws {
-        // Cancelling execute() (here via deadline) must fire ABORT TASK at the
-        // target so the orphaned command doesn't linger server-side.
+    @Test func cancelledCommandIsAutoAborted() async throws {
+        // Cancelling execute() must fire ABORT TASK at the target so the
+        // orphaned command doesn't linger server-side. Cancelled once the
+        // target holds the command, not by a fixed deadline: on a loaded
+        // machine a 200 ms deadline can fire before the command is sent, and
+        // then the empty stall list below proves nothing. A deadline cancels
+        // the same way — `withDeadline` cancels its operation's task.
         var targetConfig = MockTargetConfig()
         targetConfig.faults.stallCommands = true
         let (connection, harness, _) = try await loggedInConnection(targetConfig: targetConfig)
 
-        await #expect(throws: DeadlineError.timedOut) {
-            try await withDeadline(.milliseconds(200)) {
-                _ = try await connection.execute(SCSITask(lun: 0, cdb: CDB.testUnitReady()))
-            }
+        let command = Task {
+            try await connection.execute(SCSITask(lun: 0, cdb: CDB.testUnitReady()))
         }
-        // Give the cancellation-handler TMF a moment to land.
-        try await Task.sleep(for: .milliseconds(100))
-        #expect(await harness.target.stalledITTs.isEmpty)
+        #expect(await eventually { await harness.target.stalledITTs.count == 1 },
+                "the command never reached the target")
+        command.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await command.value }
+        #expect(await eventually { await harness.target.stalledITTs.isEmpty },
+                "ABORT TASK never cleared the command at the target")
         // The connection is still healthy after the abort.
         try await connection.ping()
         await harness.finish()
@@ -212,8 +217,8 @@ struct HostileTargetTests {
         let hung = (0 ..< 3).map { _ in
             Task { try? await connection.execute(SCSITask(lun: 0, cdb: CDB.testUnitReady())) }
         }
-        try await Task.sleep(for: .milliseconds(100))
-        #expect(await harness.target.stalledITTs.count == 3)
+        #expect(await eventually { await harness.target.stalledITTs.count == 3 },
+                "three commands should be stalled at the target")
 
         let tmf = try await connection.taskManagement(.lunReset, lun: 0)
         #expect(tmf == .functionComplete)
