@@ -165,16 +165,13 @@ struct LoopbackTCPTests {
     /// failing instantly, cut a strict pin's recovery window to a quarter.
     @Test("strict: a refused connection is not reported as an interface failure")
     func strictRefusalIsNotAnInterfaceFailure() async {
-        do {
+        // The deadline, exactly as an unpinned connect to a closed port: not
+        // `interfaceUnavailable`, and not any other early failure either.
+        await #expect(throws: DeadlineError.timedOut) {
             _ = try await NetworkTransport.connect(
                 host: "127.0.0.1", port: 1,
                 binding: InterfaceBinding(name: "lo0", fallback: false),
                 timeout: .milliseconds(500))
-            Issue.record("connected to a closed port")
-        } catch let TransportError.interfaceUnavailable(name, reason) {
-            Issue.record("a refusal was reported as an interface failure: \(name): \(reason)")
-        } catch {
-            // The deadline, exactly as an unpinned connect to a closed port.
         }
     }
 
